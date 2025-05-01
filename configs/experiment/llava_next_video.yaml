@@ -20,8 +20,8 @@ trainer:
   min_epochs: 1
   max_epochs: 10
   # gradient_clip_val: 0.5
-  accelerator: cpu
-  # devices: 4
+  accelerator: gpu
+  devices: 4
   precision: 32
   # strategy: 
     # _target_: lightning.pytorch.strategies.DeepSpeedStrategy
