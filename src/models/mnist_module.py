@@ -13,7 +13,7 @@ class MNISTLitModule(LightningModule):
 
     ```python
     def __init__(self):
-    # Define initialization code here.
+    # Define initialization code xhere.
 
     def setup(self, stage):
     # Things to setup before each stage, 'fit', 'validate', 'test', 'predict'.

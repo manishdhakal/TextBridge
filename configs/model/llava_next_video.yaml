@@ -1,0 +1,19 @@
+_target_: src.models.preference_module.PreferenceModule
+
+optimizer:
+  _target_: torch.optim.SGD
+  _partial_: true
+  lr: 0.001
+  # weight_decay: 0.0
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
+  _partial_: true
+  mode: min
+  factor: 0.1
+  patience: 10
+
+num_output_tokens: ${data.num_output_tokens}
+
+# compile model for faster training with pytorch 2.0
+compile: false

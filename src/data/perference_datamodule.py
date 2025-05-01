@@ -13,31 +13,10 @@ from lightning import LightningDataModule
 from transformers import AutoProcessor
 
 
-def read_video_pyav(container, indices):
-    """
-    Decode the video with PyAV decoder.
-    Args:
-        container (`av.container.input.InputContainer`): PyAV container.
-        indices (`List[int]`): List of frame indices to decode.
-    Returns:
-        result (np.ndarray): np array of decoded frames of shape (num_frames, height, width, 3).
-    """
-    frames = []
-    container.seek(0)
-    start_index = indices[0]
-    end_index = indices[-1]
-    for i, frame in enumerate(container.decode(video=0)):
-        if i > end_index:
-            break
-        if i >= start_index and i in indices:
-            frames.append(frame)
-    return np.stack([x.to_ndarray(format="rgb24") for x in frames])
-
-
 class MUStARDPreferenceDataset(Dataset):
     def __init__(
         self,
-        pref_data_dir: str,
+        preference_data_path: str,
         video_dir: str,
         num_frames: int,
         num_input_tokens: int = 1170,
@@ -46,7 +25,7 @@ class MUStARDPreferenceDataset(Dataset):
         self.video_dir = video_dir
         self.num_frames = num_frames
 
-        self.description = pd.read_csv(pref_data_dir)
+        self.description = pd.read_csv(preference_data_path)
         self.processor = AutoProcessor.from_pretrained(
             "llava-hf/LLaVA-NeXT-Video-7B-hf"
         )
@@ -61,27 +40,50 @@ class MUStARDPreferenceDataset(Dataset):
 
     def __len__(self):
         return len(self.description)
-
+    
+    def _read_video_pyav(self, container, indices):
+        """
+        Decode the video with PyAV decoder.
+        Args:
+            container (`av.container.input.InputContainer`): PyAV container.
+            indices (`List[int]`): List of frame indices to decode.
+        Returns:
+            result (np.ndarray): np array of decoded frames of shape (num_frames, height, width, 3).
+        """
+        frames = []
+        container.seek(0)
+        start_index = indices[0]
+        end_index = indices[-1]
+        for i, frame in enumerate(container.decode(video=0)):
+            if i > end_index:
+                break
+            if i >= start_index and i in indices:
+                frames.append(frame)
+        return np.stack([x.to_ndarray(format="rgb24") for x in frames])
+    
     def __getitem__(self, idx):
         row = self.description.iloc[idx]
         video_id = row["video_id"]
-        video_path = os.path.join(self.video_dir, video_id)
+        video_path = os.path.join(self.video_dir, f"{video_id}.mp4")
         container = av.open(video_path)
         total_frames = container.streams.video[0].frames
         indices = np.arange(0, total_frames, total_frames / self.num_frames).astype(int)
-        clip = read_video_pyav(container, indices)
+        clip = self._read_video_pyav(container, indices)
         inputs_video = self.processor(
             text=self.prompt,
             videos=clip,
             return_tensors="pt",
             max_length=self.num_input_tokens,
+            truncation=True,
         )
+        
+        eos_token = self.processor.tokenizer.eos_token
         preferred_desc, dispreferred_desc = (
-            row["preferred_description"],
-            row["dispreferred_description"],
+            row["preferred_description"] + eos_token,
+            row["dispreferred_description"] + eos_token,
         )
 
-        tokenized_desc = self.processor.tokenizer(
+        gt_desc = self.processor.tokenizer(
             [preferred_desc, dispreferred_desc],
             return_tensors="pt",
             max_length=self.num_output_tokens,
@@ -95,22 +97,17 @@ class MUStARDPreferenceDataset(Dataset):
             "input_ids": inputs_video["input_ids"].squeeze(0),
             "attention_mask": inputs_video["attention_mask"].squeeze(0),
             "pixel_values_videos": inputs_video["pixel_values_videos"].squeeze(0),
-            "preferred_input_ids": tokenized_desc["input_ids"][0],
-            "preferred_attention_mask": tokenized_desc["attention_mask"][0],
-            "dispreferred_input_ids": tokenized_desc["input_ids"][1],
-            "dispreferred_attention_mask": tokenized_desc["attention_mask"][1],
+            "preferred_ids": gt_desc["input_ids"][0],
+            "dispreferred_ids": gt_desc["input_ids"][1],
         }
 
 
-class MNISTDataModule(LightningDataModule):
+class PreferenceDataModule(LightningDataModule):
     """`LightningDataModule` for the MNIST dataset.
 
-    The MNIST database of handwritten digits has a training set of 60,000 examples, and a test set of 10,000 examples.
-    It is a subset of a larger set available from NIST. The digits have been size-normalized and centered in a
-    fixed-size image. The original black and white images from NIST were size normalized to fit in a 20x20 pixel box
-    while preserving their aspect ratio. The resulting images contain grey levels as a result of the anti-aliasing
-    technique used by the normalization algorithm. the images were centered in a 28x28 image by computing the center of
-    mass of the pixels, and translating the image so as to position this point at the center of the 28x28 field.
+    The MUStARDPreferenceDataset is a dataset for video preference learning. 
+    It contains a collection of videos and their corresponding preferred and dispreferred descriptions.
+    The dataset is used to train a model to learn the preference between two descriptions of the same video.
 
     A `LightningDataModule` implements 7 key methods:
 
@@ -149,13 +146,16 @@ class MNISTDataModule(LightningDataModule):
 
     def __init__(
         self,
-        data_dir: str = "data/",
-        train_val_test_split: Tuple[int, int, int] = (55_000, 5_000, 10_000),
+        preference_data_path: str,
+        video_dir: str,
+        num_frames: int,
+        num_input_tokens: int = 1170,
+        num_output_tokens: int = 500,
         batch_size: int = 64,
         num_workers: int = 0,
         pin_memory: bool = False,
     ) -> None:
-        """Initialize a `MNISTDataModule`.
+        """Initialize a `PreferenceDataModule`.
 
         :param data_dir: The data directory. Defaults to `"data/"`.
         :param train_val_test_split: The train, validation and test split. Defaults to `(55_000, 5_000, 10_000)`.
@@ -169,24 +169,18 @@ class MNISTDataModule(LightningDataModule):
         # also ensures init params will be stored in ckpt
         self.save_hyperparameters(logger=False)
 
-        # data transformations
-        self.transforms = transforms.Compose(
-            [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
+        self.data_train = MUStARDPreferenceDataset(
+            preference_data_path=self.hparams.preference_data_path,
+            video_dir=self.hparams.video_dir,
+            num_frames=self.hparams.num_frames,
+            num_input_tokens=self.hparams.num_input_tokens,
+            num_output_tokens=self.hparams.num_output_tokens,
         )
-
-        self.data_train: Optional[Dataset] = None
+        
         self.data_val: Optional[Dataset] = None
         self.data_test: Optional[Dataset] = None
 
         self.batch_size_per_device = batch_size
-
-    @property
-    def num_classes(self) -> int:
-        """Get the number of classes.
-
-        :return: The number of MNIST classes (10).
-        """
-        return 10
 
     def prepare_data(self) -> None:
         """Download data if needed. Lightning ensures that `self.prepare_data()` is called only
@@ -196,8 +190,7 @@ class MNISTDataModule(LightningDataModule):
 
         Do not use it to assign state (self.x = y).
         """
-        MNIST(self.hparams.data_dir, train=True, download=True)
-        MNIST(self.hparams.data_dir, train=False, download=True)
+        pass
 
     def setup(self, stage: Optional[str] = None) -> None:
         """Load data. Set variables: `self.data_train`, `self.data_val`, `self.data_test`.
@@ -210,7 +203,7 @@ class MNISTDataModule(LightningDataModule):
         :param stage: The stage to setup. Either `"fit"`, `"validate"`, `"test"`, or `"predict"`. Defaults to ``None``.
         """
         # Divide batch size by the number of devices.
-        if self.trainer is not None:
+        if self.trainer is not None and self.trainer.strategy == "ddp":
             if self.hparams.batch_size % self.trainer.world_size != 0:
                 raise RuntimeError(
                     f"Batch size ({self.hparams.batch_size}) is not divisible by the number of devices ({self.trainer.world_size})."
@@ -219,20 +212,23 @@ class MNISTDataModule(LightningDataModule):
                 self.hparams.batch_size // self.trainer.world_size
             )
 
-        # load and split datasets only if not loaded already
-        if not self.data_train and not self.data_val and not self.data_test:
-            trainset = MNIST(
-                self.hparams.data_dir, train=True, transform=self.transforms
-            )
-            testset = MNIST(
-                self.hparams.data_dir, train=False, transform=self.transforms
-            )
-            dataset = ConcatDataset(datasets=[trainset, testset])
-            self.data_train, self.data_val, self.data_test = random_split(
-                dataset=dataset,
-                lengths=self.hparams.train_val_test_split,
-                generator=torch.Generator().manual_seed(42),
-            )
+        # # load and split datasets only if not loaded already
+        # if not self.data_train and not self.data_val and not self.data_test:
+        #     trainset = MNIST(
+        #         self.hparams.data_dir, train=True, transform=self.transforms
+        #     )
+        #     testset = MNIST(
+        #         self.hparams.data_dir, train=False, transform=self.transforms
+        #     )
+        #     dataset = ConcatDataset(datasets=[trainset, testset])
+        #     self.data_train, self.data_val, self.data_test = random_split(
+        #         dataset=dataset,
+        #         lengths=self.hparams.train_val_test_split,
+        #         generator=torch.Generator().manual_seed(42),
+        #     )
+        
+        pass
+        
 
     def train_dataloader(self) -> DataLoader[Any]:
         """Create and return the train dataloader.
@@ -252,26 +248,30 @@ class MNISTDataModule(LightningDataModule):
 
         :return: The validation dataloader.
         """
-        return DataLoader(
-            dataset=self.data_val,
-            batch_size=self.batch_size_per_device,
-            num_workers=self.hparams.num_workers,
-            pin_memory=self.hparams.pin_memory,
-            shuffle=False,
-        )
+        # return DataLoader(
+        #     dataset=self.data_val,
+        #     batch_size=self.batch_size_per_device,
+        #     num_workers=self.hparams.num_workers,
+        #     pin_memory=self.hparams.pin_memory,
+        #     shuffle=False,
+        # )
+        return None
+        
 
     def test_dataloader(self) -> DataLoader[Any]:
         """Create and return the test dataloader.
 
         :return: The test dataloader.
         """
-        return DataLoader(
-            dataset=self.data_test,
-            batch_size=self.batch_size_per_device,
-            num_workers=self.hparams.num_workers,
-            pin_memory=self.hparams.pin_memory,
-            shuffle=False,
-        )
+        
+        # return DataLoader(
+        #     dataset=self.data_test,
+        #     batch_size=self.batch_size_per_device,
+        #     num_workers=self.hparams.num_workers,
+        #     pin_memory=self.hparams.pin_memory,
+        #     shuffle=False,
+        # )
+        return None
 
     def teardown(self, stage: Optional[str] = None) -> None:
         """Lightning hook for cleaning up after `trainer.fit()`, `trainer.validate()`,
@@ -299,4 +299,5 @@ class MNISTDataModule(LightningDataModule):
 
 
 if __name__ == "__main__":
-    _ = MNISTDataModule()
+    # _ = MNISTDataModule()
+    pass

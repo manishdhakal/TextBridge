@@ -1,0 +1,9 @@
+_target_: src.data.perference_datamodule.PreferenceDataModule
+preference_data_path: data/video_description_preference_lava_gt_sorted_fixed.csv
+video_dir: data/MUStARD/videos/utterances_final
+num_frames: 8
+num_input_tokens: 1170
+num_output_tokens: 5
+batch_size: 4 # Needs to be divisible by the number of devices (e.g., if in a distributed setup)
+num_workers: 16
+pin_memory: True
