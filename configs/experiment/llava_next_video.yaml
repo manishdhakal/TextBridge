@@ -21,11 +21,12 @@ trainer:
   max_epochs: 10
   # gradient_clip_val: 0.5
   accelerator: gpu
-  devices: 4
-  precision: 32
-  # strategy: 
+  devices: 6
+  precision: 16
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
     # _target_: lightning.pytorch.strategies.DeepSpeedStrategy
-    # stage: 3
+    # stage: 1
     # offload_optimizer: True
     # offload_parameters: True
     # _target_: lightning.pytorch.strategies.FSDPStrategy

@@ -2,23 +2,69 @@ from typing import Any, Dict, Tuple
 import copy
 
 import torch
+from torch import nn
+from torch.nn import functional as F
+
 from lightning import LightningModule
 from torchmetrics import MaxMetric, MeanMetric
 from torchmetrics.classification.accuracy import Accuracy
 
-from transformers import LlavaNextVideoForConditionalGeneration
+from transformers import LlavaNextVideoForConditionalGeneration, BitsAndBytesConfig
 
 from peft import LoraConfig, get_peft_model
 
+# from bitsandbytes import  Bit
 from .loss import DPOLoss
 
 lora_cofig = LoraConfig(
     r=1,
     lora_alpha=16,
-    target_modules=["q_proj", "k_proj", "v_proj"],
-    lora_dropout=0.,
+    target_modules=["q_proj", "k_proj"],
+    lora_dropout=0.0,
     bias="none",
 )
+
+quantization_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_quant_type="nf4",
+)
+
+
+class LogProbability(nn.Module):
+    def __init__(self, dim: int = -1):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, logits: torch.Tensor, labels: torch.LongTensor) -> torch.Tensor:
+        """
+        Calculate the log probability of the labels given the logits.
+        Args:
+            logits (`torch.Tensor`): The logits from the model.
+            labels (`torch.LongTensor`): The labels for which to calculate the log probability.
+        Returns:
+            `torch.Tensor`: The log probabilities of the labels.
+        """
+        # Dimensions check, labels must one dim less than logits
+        if labels.dim() != logits.dim() - 1:
+            raise ValueError(
+                f"Expected labels of dimension {logits.dim() - 1} which is one dim less than logits, but got {labels.dim()}"
+            )
+
+        # Apply softmax to get probabilities
+        probs = F.softmax(logits, dim=self.dim)
+
+        # Gather the probabilities for the true labels
+        gathered_probs = probs.gather(self.dim, labels.unsqueeze(self.dim)).squeeze(
+            self.dim
+        )
+
+        # Calculate log probabilities
+        log_probs = torch.log(gathered_probs)
+
+        return log_probs
+
 
 class PreferenceModule(LightningModule):
     """Example of a `LightningModule` for MNIST classification.
@@ -73,26 +119,30 @@ class PreferenceModule(LightningModule):
         self.save_hyperparameters(logger=False)
 
         self.ref_model = LlavaNextVideoForConditionalGeneration.from_pretrained(
-            "llava-hf/LLaVA-NeXT-Video-7B-hf", torch_dtype=torch.float16
+            "llava-hf/LLaVA-NeXT-Video-7B-hf",
+            quantization_config=quantization_config,
+            torch_dtype=torch.bfloat16,
+            # device_map="",
         )
 
+        self.policy_model = copy.deepcopy(self.ref_model)
+
+        self.ref_model.eval()
         for param in self.ref_model.parameters():
             param.requires_grad = False
-        
-        # self.policy_model = copy.deepcopy(self.ref_model)
-        
-        policy_model = LlavaNextVideoForConditionalGeneration.from_pretrained(
-            "llava-hf/LLaVA-NeXT-Video-7B-hf", torch_dtype=torch.float16
-        )
+
+        # policy_model = LlavaNextVideoForConditionalGeneration.from_pretrained(
+        #     "llava-hf/LLaVA-NeXT-Video-7B-hf", torch_dtype=torch.float16
+        # )
         self.policy_model = get_peft_model(
-            policy_model,
+            self.policy_model,
             lora_cofig,
         )
         self.policy_model.print_trainable_parameters()
 
-
         # calculate the log probability of all generated tokens
-        self.compute_logps = torch.nn.CrossEntropyLoss(reduction="none")
+        self.compute_logps = LogProbability(dim=-1)
+
         self.dpo_loss = DPOLoss(beta=0.1)
 
         # metric objects for calculating and averaging accuracy across batches
@@ -189,11 +239,10 @@ class PreferenceModule(LightningModule):
         )
         ref_inputs = inputs_video.copy()
 
-        self.ref_model.eval()
         with torch.no_grad():
             predicted_outputs = None
             logits = []
-            for _ in range(self.hparams.num_output_tokens):
+            for i in range(self.hparams.num_output_tokens):
                 ref_inputs = self._prepare_inputs_for_generation(
                     ref_inputs, predicted_outputs=predicted_outputs
                 )
@@ -201,12 +250,8 @@ class PreferenceModule(LightningModule):
                 logits.append(predicted_outputs["logits"])
             logits = torch.cat(logits, dim=1)
 
-        reference_prefered_logps = self.compute_logps(
-            logits.permute(0, 2, 1), preferred_ids
-        )
-        reference_disprefered_logps = self.compute_logps(
-            logits.permute(0, 2, 1), dispreferred_ids
-        )
+        reference_prefered_logps = self.compute_logps(logits, preferred_ids)
+        reference_disprefered_logps = self.compute_logps(logits, dispreferred_ids)
 
         policy_inputs = inputs_video
         predicted_outputs = None
@@ -218,12 +263,8 @@ class PreferenceModule(LightningModule):
             predicted_outputs = self.policy_model(**policy_inputs)
             logits.append(predicted_outputs["logits"])
         logits = torch.cat(logits, dim=1)
-        policy_prefered_logps = self.compute_logps(
-            logits.permute(0, 2, 1), preferred_ids
-        )
-        policy_disprefered_logps = self.compute_logps(
-            logits.permute(0, 2, 1), dispreferred_ids
-        )
+        policy_prefered_logps = self.compute_logps(logits, preferred_ids)
+        policy_disprefered_logps = self.compute_logps(logits, dispreferred_ids)
 
         # calculate the loss
         loss = self.dpo_loss(
@@ -271,14 +312,18 @@ class PreferenceModule(LightningModule):
         :param batch_idx: The index of the current batch.
         :return: A tensor of losses between model predictions and targets.
         """
-        
+
         loss = self.calculate_dpo_loss(**batch)
-        
+
         # update and log metrics
         self.train_loss(loss)
         # self.train_acc(preds, targets)
         self.log(
-            "train/dpo_loss", self.train_loss, on_step=True, on_epoch=True, prog_bar=True
+            "train/dpo_loss",
+            self.train_loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
         )
         # self.log("train/acc", self.train_acc, on_step=False, on_epoch=True, prog_bar=True)
 
@@ -314,7 +359,7 @@ class PreferenceModule(LightningModule):
         :param batch_idx: The index of the current batch.
         """
         pass
-    
+
     def on_test_epoch_end(self) -> None:
         """Lightning hook that is called when a test epoch ends."""
         pass
@@ -357,4 +402,5 @@ class PreferenceModule(LightningModule):
 
 
 if __name__ == "__main__":
-    _ = MNISTLitModule(None, None, None, None)
+    # _ = MNISTLitModule(None, None, None, None)
+    pass
