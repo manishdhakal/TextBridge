@@ -21,16 +21,16 @@ trainer:
   max_epochs: 10
   # gradient_clip_val: 0.5
   accelerator: gpu
-  devices: 6
+  devices: [0,1,2,3,4,5]
   precision: 16
   strategy:
-    _target_: lightning.pytorch.strategies.DDPStrategy
+    # _target_: lightning.pytorch.strategies.DDPStrategy
     # _target_: lightning.pytorch.strategies.DeepSpeedStrategy
-    # stage: 1
+    # stage: 3
     # offload_optimizer: True
     # offload_parameters: True
-    # _target_: lightning.pytorch.strategies.FSDPStrategy
-    # sharding_strategy: FULL_SHARD
+    _target_: lightning.pytorch.strategies.FSDPStrategy
+    sharding_strategy: FULL_SHARD
     # state_dict_type: sharded
 
 

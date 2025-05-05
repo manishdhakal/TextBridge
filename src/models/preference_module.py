@@ -9,7 +9,7 @@ from lightning import LightningModule
 from torchmetrics import MaxMetric, MeanMetric
 from torchmetrics.classification.accuracy import Accuracy
 
-from transformers import LlavaNextVideoForConditionalGeneration, BitsAndBytesConfig
+from transformers import LlavaNextVideoForConditionalGeneration, BitsAndBytesConfig, AutoModel
 
 from peft import LoraConfig, get_peft_model
 
@@ -24,12 +24,12 @@ lora_cofig = LoraConfig(
     bias="none",
 )
 
-quantization_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_use_double_quant=True,
-    bnb_4bit_compute_dtype=torch.float16,
-    bnb_4bit_quant_type="nf4",
-)
+# quantization_config = BitsAndBytesConfig(
+#     load_in_4bit=True,
+#     bnb_4bit_use_double_quant=True,
+#     bnb_4bit_compute_dtype=torch.bfloat16,
+#     bnb_4bit_quant_type="nf4",
+# )
 
 
 class LogProbability(nn.Module):
@@ -120,10 +120,13 @@ class PreferenceModule(LightningModule):
 
         self.ref_model = LlavaNextVideoForConditionalGeneration.from_pretrained(
             "llava-hf/LLaVA-NeXT-Video-7B-hf",
-            quantization_config=quantization_config,
-            torch_dtype=torch.bfloat16,
-            # device_map="",
+            # quantization_config=quantization_config,
+            torch_dtype=torch.float16,
+            # device_map="auto",
         )
+        
+        # self.ref_model = AutoModel.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
+            
 
         self.policy_model = copy.deepcopy(self.ref_model)
 
@@ -227,7 +230,7 @@ class PreferenceModule(LightningModule):
                 inputs_video, first_input=False
             )
             inputs_video["past_key_values"] = predicted_outputs["past_key_values"]
-            inputs_video["logits_to_keep"] = 1
+            # inputs_video["logits_to_keep"] = 0
             inputs_video["use_cache"] = True
             inputs_video["pixel_values_videos"] = None
         return inputs_video
@@ -247,6 +250,7 @@ class PreferenceModule(LightningModule):
                     ref_inputs, predicted_outputs=predicted_outputs
                 )
                 predicted_outputs = self.ref_model(**ref_inputs)
+                print(predicted_outputs)
                 logits.append(predicted_outputs["logits"])
             logits = torch.cat(logits, dim=1)
 

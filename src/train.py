@@ -1,9 +1,10 @@
 from typing import Any, Dict, List, Optional, Tuple
-
+import os
 import hydra
 import lightning as L
 import rootutils
 import torch
+from torch import distributed as dist
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig
@@ -38,6 +39,20 @@ from src.utils import (
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
+
+# def setup_distributed():
+#     """Initialize the distributed process group."""
+#     if not dist.is_initialized():
+#         dist.init_process_group(backend="nccl")  # NCCL for GPUs
+#         rank = dist.get_rank()
+#         world_size = dist.get_world_size()
+#         torch.cuda.set_device(rank)
+#         print(f"Rank {rank}/{world_size} initialized")
+#     else:
+#         print("Process group already initialized")
+
+
+# setup_distributed()
 
 @task_wrapper
 def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
